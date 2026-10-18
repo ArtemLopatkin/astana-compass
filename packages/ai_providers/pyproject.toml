@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "astana-ai-providers"
+version = "0.1.0"
+description = "Bounded, grounded explanation adapters for hosted OpenAI and NVIDIA APIs"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = ["httpx>=0.28,<1", "astana-recommender>=0.1.0,<0.2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/astana_ai_providers"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
