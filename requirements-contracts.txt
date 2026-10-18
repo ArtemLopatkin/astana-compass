@@ -1,0 +1,2 @@
+# Verified against https://pypi.org/pypi/jsonschema/json
+jsonschema[format-nongpl]==4.26.0
