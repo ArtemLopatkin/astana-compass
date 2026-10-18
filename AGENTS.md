@@ -6,9 +6,9 @@
 
 ## Работа с Git
 
-- Каждый агент работает в отдельном clone/worktree и ветке `agent/NN-topic` от актуального `origin/main`.
+- Каждый агент работает в отдельном clone/worktree и ветке `team/01-data-search`, `team/02-context-routes` или `team/03-frontend-ux` от актуального `origin/main`.
 - В первом PR укажите исходный commit SHA, номер агента и область изменений.
-- Пушьте в свою ветку и открывайте PR в `main`. Не пушьте в `main`, не выполняйте merge и не включайте auto-merge. Начальная загрузка репозитория координатором — единственное стартовое исключение.
+- Публичный репозиторий допускает fork. Пушьте в свою ветку своего fork и открывайте upstream PR в `main`. Не пушьте в `main`, не выполняйте merge и не включайте auto-merge. Начальная загрузка репозитория координатором — единственное стартовое исключение.
 - Не выполняйте force push в чужие ветки. После начала review предпочтительны обычные новые commits.
 - Один PR должен оставаться проверяемым. Сначала рабочий сквозной результат своего модуля, затем расширения отдельными PR.
 - Для merge нужны выполненные проверки, review координатора и проверка совместимости. Не объявляйте CI зелёным, если проверки не запускались.
@@ -18,23 +18,16 @@
 
 | Владелец | Пути |
 |---|---|
-| Координатор | корневые файлы; `packages/contracts/**`; `packages/api_client/**`; `migrations/**`; общие manifests и lockfiles; общие fixtures |
-| 01 Data | `packages/city_data/**`, `data/manifests/**`, `data/samples/**`, `docs/data/**` |
-| 02 Retrieval | `packages/retrieval/**`, `docs/retrieval/**` |
-| 03 Context | `packages/city_context/**`, `docs/context/**` |
-| 04 API/RAG | `services/api/**`, `packages/recommender/**`, `docs/api/**` |
-| 05 Frontend | `apps/web/**`, `docs/ux/**` |
-| 06 Evaluation | `evals/**`, `tests/integration/**`, `docs/evaluation/**` |
-| 07 DevOps | `infra/**`, `.github/**`, `docs/operations/**` |
-| 08 Product/QA | `docs/product/**`, `docs/pitch/**`, `docs/privacy/**`, `docs/qa/**`, `tests/e2e/**` |
+| Координатор | корневые manifests/lockfiles/документы; `packages/contracts/**`; `packages/api_client/**`; `services/api/**`; `packages/recommender/**`; `packages/ai_providers/**`; `migrations/**`; `infra/**`; `.github/**`; `evals/**`; `tests/integration/**`; `docs/api/**`; `docs/ai/**`; `docs/operations/**` |
+| Team 01 Data/Search | `packages/city_data/**`, `packages/retrieval/**`, `data/manifests/**`, `data/samples/**`, `docs/data/**`, `docs/retrieval/**` |
+| Team 02 Context/Routes | `packages/city_context/**`, `docs/context/**` |
+| Team 03 Frontend/UX | `apps/web/**`, `tests/e2e/**`, `docs/ux/**`, `docs/pitch/**` |
 
-Тесты отдельного Python-модуля находятся внутри его каталога. Даже внутри вашей области общие dependency manifests и lockfiles не меняются без согласованного контракта. Агент 05 может предложить первоначальный `apps/web/package.json`, агент 07 — общий workspace/config; координатор принимает их отдельным foundation PR перед объединением зависимого кода. Не добавляйте альтернативный стек.
-
-Каждому агенту разрешён собственный `docs/requests/NN-*.md` для запросов изменения общих интерфейсов, зависимостей и инфраструктуры. В запросе укажите проблему, точную схему/версию, влияние, совместимый переход и проверку. Это не разрешение немедленно применять предлагаемое изменение.
+Три `TEAM-*.md` заменяют прежние восемь `TASK-*.md`. Можно делегировать своим subagents внутри своей области. Manifest собственного модуля принадлежит команде; корневые workspace/dependencies и общие lockfiles интегрирует координатор. Не добавляйте альтернативный стек. Межкомандные изменения предлагаются в `docs/requests/team-NN-*.md` с точной схемой, совместимым переходом и тестом. Фабрики интеграции описаны в `docs/api/README.md`.
 
 ## Контракты и факты
 
-- `contracts.schema.json` — единственный seed источник схем. Не заводите конкурирующие независимые версии DTO. Языковые модели/клиенты генерируются или проверяются относительно него.
+- `contracts.schema.json` — единственный канонический источник схем. Не заводите конкурирующие независимые версии DTO. Языковые модели/клиенты генерируются или проверяются относительно него.
 - До генерации shared SDK допускается локальный adapter, который валидирует boundary JSON по canonical schema; он не определяет альтернативный public contract.
 - Межмодульные порты описаны в `CONTRACTS.md`. Зависимость от чужой реализации заменяется тестовым adapter/fixture; не пишите вторую реализацию чужого модуля.
 - JSON coordinates: `{lat, lon}`; GeoJSON: `[lon, lat]`; расстояния в метрах; время в секундах; деньги в KZT; timestamps с timezone; городское время `Asia/Almaty`.

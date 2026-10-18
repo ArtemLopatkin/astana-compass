@@ -1,0 +1,12 @@
+{
+  "name": "astana-contract-types-check",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Isolated pinned compiler for shared boundary types; not the frontend toolchain",
+  "devDependencies": {
+    "typescript": "7.0.2"
+  },
+  "scripts": {
+    "check": "tsc --noEmit --strict --moduleResolution bundler --module esnext --target es2022 ../../packages/api_client/src/index.ts"
+  }
+}

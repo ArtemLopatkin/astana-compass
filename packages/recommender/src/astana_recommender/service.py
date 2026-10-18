@@ -1,0 +1,525 @@
+"""Bounded recommendation orchestration with deterministic final policy checks."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from copy import deepcopy
+from datetime import datetime, timezone
+import json
+import math
+from typing import Any
+from uuid import uuid4
+
+from astana_contracts import (
+    JSON,
+    ContextProvider,
+    PlaceRepository,
+    Retriever,
+    validate_payload,
+)
+
+from .explanations import ExplanationGenerator, GroundedExplanation, GroundedReason
+from .text import TEXT, label
+
+
+DYNAMIC_FACT_KEYS = frozenset({"open_at_requested_time", "weather_suitable"})
+
+
+class RecommenderError(ValueError):
+    """Safe public service failure for the HTTP adapter to map."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+def _same_value(left: Any, right: Any) -> bool:
+    """JSON equality, preserving the distinction between booleans and numbers."""
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    if isinstance(left, list) or isinstance(right, list):
+        return (
+            isinstance(left, list)
+            and isinstance(right, list)
+            and len(left) == len(right)
+            and all(_same_value(a, b) for a, b in zip(left, right, strict=True))
+        )
+    return left == right
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+class DefaultRecommendationService:
+    """Implement the canonical async RecommendationService port.
+
+    No network clients are constructed here. Dependencies own provider I/O.
+    Every dependency call is bounded; cancellation is allowed to propagate.
+    Source documents and query text are never executed or logged.
+    """
+
+    def __init__(
+        self,
+        repository: PlaceRepository,
+        retriever: Retriever,
+        context: ContextProvider,
+        generator: ExplanationGenerator | None = None,
+        *,
+        candidate_limit: int = 24,
+        radius_meters: float = 10_000,
+        timeout_seconds: float = 8,
+        default_visit_seconds: int = 1_200,
+        route_concurrency: int = 4,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if type(candidate_limit) is not int or not 1 <= candidate_limit <= 100:
+            raise ValueError("candidate_limit must be an integer from 1 to 100")
+        if type(default_visit_seconds) is not int or default_visit_seconds < 1:
+            raise ValueError("default_visit_seconds must be a positive integer")
+        if type(route_concurrency) is not int or not 1 <= route_concurrency <= 16:
+            raise ValueError("route_concurrency must be an integer from 1 to 16")
+        if (
+            isinstance(radius_meters, bool)
+            or not math.isfinite(radius_meters)
+            or radius_meters <= 0
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("radius and timeout must be positive finite numbers")
+        self.repository = repository
+        self.retriever = retriever
+        self.context = context
+        self.generator = generator
+        self.candidate_limit = candidate_limit
+        self.radius_meters = radius_meters
+        self.timeout_seconds = timeout_seconds
+        self.default_visit_seconds = default_visit_seconds
+        self.route_concurrency = route_concurrency
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _request(self, definition: str, request: JSON) -> JSON:
+        validate_payload(definition, request)
+        value = deepcopy(request)
+        if value["transport"] != "walking":
+            raise RecommenderError("unsupported_transport", TEXT[value["locale"]]["unsupported"])
+        return value
+
+    def _base(self, request: JSON, *, itinerary: bool = False) -> JSON:
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("clock must return a timezone-aware datetime")
+        base: JSON = {
+            "request_id": f"req:{uuid4()}",
+            "status": "no_match",
+            "request": deepcopy(request),
+            "places": [],
+            "clarification_questions": [],
+            "warnings": [] if self.generator else [TEXT[request["locale"]]["no_model"]],
+            "generated_at": now.astimezone(timezone.utc).isoformat(),
+        }
+        if itinerary:
+            base.update(stops=[], route=None, total_duration_seconds=0)
+        else:
+            base["recommendations"] = []
+        return base
+
+    @staticmethod
+    def _finish(response: JSON, *, itinerary: bool = False) -> JSON:
+        response["warnings"] = _dedupe(response["warnings"])
+        return validate_payload(
+            "ItineraryResponse" if itinerary else "RecommendationResponse", response
+        )
+
+    async def _retrieve(self, request: JSON) -> tuple[list[JSON], list[str], bool]:
+        locale = request["locale"]
+        payload = {
+            "query": request["query"],
+            "locale": locale,
+            "origin": deepcopy(request["origin"]),
+            "radius_meters": self.radius_meters,
+            "constraints": deepcopy(request["constraints"]),
+            "candidate_limit": self.candidate_limit,
+        }
+        validate_payload("RetrievalRequest", payload)
+        try:
+            result = await asyncio.wait_for(
+                self.retriever.retrieve(payload), timeout=self.timeout_seconds
+            )
+            validate_payload("RetrievalResponse", result)
+            places = {p["id"]: p for p in result["places"]}
+            candidates = [
+                deepcopy(places[h["place_id"]])
+                for h in result["hits"][: self.candidate_limit]
+            ]
+            return candidates, list(result["warnings"]), False
+        except Exception:
+            # Never echo provider exceptions: they may contain tokens or raw input.
+            warnings = [TEXT[locale]["retrieval_failed"]]
+        try:
+            nearby = await asyncio.wait_for(
+                self.repository.nearby(
+                    origin=deepcopy(request["origin"]),
+                    radius_meters=self.radius_meters,
+                    limit=self.candidate_limit,
+                ),
+                timeout=self.timeout_seconds,
+            )
+            if type(nearby) is not list:
+                raise ValueError("invalid repository result")
+            candidates = []
+            seen = set()
+            for place in nearby[: self.candidate_limit]:
+                validate_payload("Place", place)
+                if place["id"] not in seen:
+                    candidates.append(deepcopy(place))
+                    seen.add(place["id"])
+            return candidates, warnings, True
+        except Exception:
+            return [], warnings + [TEXT[locale]["data_failed"]], True
+
+    async def _enrich(
+        self, candidates: list[JSON], request: JSON
+    ) -> tuple[list[JSON], list[str], bool]:
+        if not candidates:
+            return [], [], False
+        # ItineraryRequest has place_ids; the context port takes RecommendationRequest.
+        context_request = {k: deepcopy(v) for k, v in request.items() if k != "place_ids"}
+        validate_payload("RecommendationRequest", context_request)
+        originals = {p["id"]: p for p in candidates}
+        try:
+            result = await asyncio.wait_for(
+                self.context.enrich_places(
+                    places=deepcopy(candidates), request=context_request
+                ),
+                timeout=self.timeout_seconds,
+            )
+            validate_payload("ContextResult", result)
+            enriched = {p["id"]: p for p in result["places"]}
+            if enriched.keys() != originals.keys():
+                raise ValueError("context changed candidate identities")
+            for place_id, place in enriched.items():
+                original = originals[place_id]
+                for key in ("name", "location", "categories"):
+                    if place[key] != original[key]:
+                        raise ValueError("context changed stable place data")
+                facts = {fact["key"]: fact for fact in place["facts"]}
+                for fact in original["facts"]:
+                    if fact["key"] not in DYNAMIC_FACT_KEYS and facts.get(fact["key"]) != fact:
+                        raise ValueError("context rewrote a static source fact")
+                evidence = {item["id"]: item for item in place["evidence"]}
+                for item in original["evidence"]:
+                    if evidence.get(item["id"]) != item:
+                        raise ValueError("context rewrote source evidence")
+            warnings = list(result["warnings"])
+            degraded = bool(result["degraded_services"])
+            if degraded:
+                warnings.append(TEXT[request["locale"]]["context_failed"])
+            return [deepcopy(enriched[p["id"]]) for p in candidates], warnings, degraded
+        except Exception:
+            # Never reuse request-time facts from a previous request on context failure.
+            fallback = deepcopy(candidates)
+            for place in fallback:
+                for fact in place["facts"]:
+                    if fact["key"] in DYNAMIC_FACT_KEYS:
+                        fact.update(status="unknown", value=None, evidence_ids=[])
+                        fact.pop("note", None)
+            return fallback, [TEXT[request["locale"]]["context_failed"]], True
+
+    @staticmethod
+    def _evaluate(place: JSON, request: JSON) -> list[JSON]:
+        facts = {fact["key"]: fact for fact in place["facts"]}
+        text = TEXT[request["locale"]]
+        results = []
+        for constraint in request["constraints"]:
+            fact = facts.get(constraint["key"])
+            if fact is None or fact["status"] != "known":
+                outcome = "unknown"
+                evidence = list(fact["evidence_ids"]) if fact else []
+            else:
+                outcome = "satisfied" if _same_value(fact["value"], constraint["value"]) else "unsatisfied"
+                evidence = list(fact["evidence_ids"])
+            results.append({
+                "key": constraint["key"],
+                "strength": constraint["strength"],
+                "outcome": outcome,
+                "evidence_ids": evidence,
+                "explanation": text[outcome],
+            })
+        return results
+
+    @staticmethod
+    def _required_ok(evaluations: list[JSON]) -> bool:
+        return all(
+            e["strength"] != "required" or e["outcome"] == "satisfied"
+            for e in evaluations
+        )
+
+    @staticmethod
+    def _preferences_ok(evaluations: list[JSON]) -> bool:
+        return all(
+            e["strength"] != "preferred" or e["outcome"] == "satisfied"
+            for e in evaluations
+        )
+
+    def _visit_seconds(self, place: JSON) -> int:
+        for fact in place["facts"]:
+            if (
+                fact["key"] == "visit_duration_seconds"
+                and fact["status"] == "known"
+                and type(fact["value"]) is int
+                and fact["value"] > 0
+            ):
+                return fact["value"]
+        return self.default_visit_seconds
+
+    async def _route(self, places: list[JSON], request: JSON) -> JSON | None:
+        try:
+            route = await asyncio.wait_for(
+                self.context.estimate_route(
+                    origin=deepcopy(request["origin"]),
+                    destinations=[deepcopy(p["location"]) for p in places],
+                    transport=request["transport"],
+                    return_to_origin=request["return_to_origin"],
+                    start_at=request["start_at"],
+                ),
+                timeout=self.timeout_seconds,
+            )
+            validate_payload("RouteEstimate", route)
+            if route["transport"] != request["transport"]:
+                return None
+            if route["includes_return"] != request["return_to_origin"]:
+                return None
+            if route["distance_meters"] > 0 and route["duration_seconds"] == 0:
+                return None
+            ids = [e["id"] for e in route["evidence"]]
+            if len(ids) != len(set(ids)):
+                return None
+            return deepcopy(route)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _render_reason(place: JSON, reason: GroundedReason, locale: str) -> str:
+        fact = next(f for f in place["facts"] if f["key"] == reason.fact_key)
+        text = TEXT[locale]
+        value = fact["value"]
+        rendered = (
+            text["yes"] if value is True else text["no"] if value is False
+            else json.dumps(value, ensure_ascii=False)
+        )
+        return (
+            f"{label(reason.fact_key, locale)}: {rendered} "
+            f"({text['source']}: {', '.join(reason.evidence_ids)})."
+        )
+
+    @staticmethod
+    def _validate_explanation(result: GroundedExplanation, place: JSON) -> None:
+        if not isinstance(result, GroundedExplanation) or type(result.why) is not tuple:
+            raise ValueError("invalid generated explanation")
+        if result.suggested_activity not in {"observe", "explore", "take_break"}:
+            raise ValueError("unverified generated activity")
+        if len(result.why) > 8:
+            raise ValueError("too many generated reasons")
+        facts = {f["key"]: f for f in place["facts"]}
+        seen = set()
+        for reason in result.why:
+            if not isinstance(reason, GroundedReason):
+                raise ValueError("invalid generated reason")
+            fact = facts.get(reason.fact_key)
+            if fact is None or fact["status"] != "known" or reason.fact_key in seen:
+                raise ValueError("unverified generated fact")
+            if (
+                type(reason.evidence_ids) is not tuple
+                or len(reason.evidence_ids) != len(set(reason.evidence_ids))
+                or set(reason.evidence_ids) != set(fact["evidence_ids"])
+            ):
+                raise ValueError("unverified generated citation")
+            seen.add(reason.fact_key)
+
+    async def _explain(
+        self, place: JSON, evaluations: list[JSON], request: JSON, total: int
+    ) -> tuple[str, str, list[str]]:
+        locale = request["locale"]
+        text = TEXT[locale]
+        reasons = tuple(
+            GroundedReason(e["key"], tuple(e["evidence_ids"]))
+            for e in evaluations if e["outcome"] == "satisfied"
+        )
+        result = GroundedExplanation(reasons[:8])
+        warnings = []
+        if self.generator:
+            try:
+                generated = await asyncio.wait_for(
+                    self.generator.generate(
+                        locale=locale,
+                        query=request["query"],
+                        place=deepcopy(place),
+                        constraint_evaluations=deepcopy(evaluations),
+                    ),
+                    timeout=self.timeout_seconds,
+                )
+                self._validate_explanation(generated, place)
+                result = generated
+            except Exception:
+                warnings.append(text["generation_failed"])
+        why = " ".join(
+            self._render_reason(place, reason, locale) for reason in result.why
+        ) or text["found"]
+        why += " " + text["time"].format(minutes=math.ceil(total / 60))
+        return why, text[result.suggested_activity], warnings
+
+    @staticmethod
+    def _route_warnings(places: list[JSON], route: JSON, locale: str) -> list[str]:
+        warnings = [TEXT[locale]["visit"]]
+        if route["method"] == "approximate":
+            warnings.append(TEXT[locale]["approximate"])
+        if any(p["is_synthetic"] for p in places) or any(
+            e["is_synthetic"] for e in route["evidence"]
+        ):
+            warnings.append(TEXT[locale]["synthetic"])
+        return warnings
+
+    async def recommend(self, request: JSON) -> JSON:
+        request = self._request("RecommendationRequest", request)
+        response = self._base(request)
+        text = TEXT[request["locale"]]
+        candidates, warnings, degraded = await self._retrieve(request)
+        response["warnings"].extend(warnings)
+        candidates, warnings, context_degraded = await self._enrich(candidates, request)
+        response["warnings"].extend(warnings)
+        degraded |= context_degraded
+
+        eligible = []
+        for index, place in enumerate(candidates):
+            evaluations = self._evaluate(place, request)
+            if self._required_ok(evaluations):
+                preferred_count = sum(
+                    e["strength"] == "preferred" and e["outcome"] == "satisfied"
+                    for e in evaluations
+                )
+                eligible.append((place, evaluations, index, preferred_count))
+        # Retrieval order breaks ties; scores from unrelated backends are not compared.
+        eligible.sort(key=lambda item: (-item[3], item[2]))
+        route_failed = False
+        for offset in range(0, len(eligible), self.route_concurrency):
+            batch = eligible[offset : offset + self.route_concurrency]
+            routes = await asyncio.gather(*(self._route([item[0]], request) for item in batch))
+            for (place, evaluations, _, _), route in zip(batch, routes, strict=True):
+                if route is None:
+                    route_failed = True
+                    continue
+                visit = self._visit_seconds(place)
+                total = route["duration_seconds"] + visit
+                if total > request["available_seconds"]:
+                    continue
+                why, activity, generator_warnings = await self._explain(
+                    place, evaluations, request, total
+                )
+                item_warnings = self._route_warnings([place], route, request["locale"])
+                item_warnings.extend(generator_warnings)
+                if not self._preferences_ok(evaluations):
+                    item_warnings.append(text["preferences"])
+                    degraded = True
+                if route["method"] == "approximate" or generator_warnings:
+                    degraded = True
+                recommendation = {
+                    "place_id": place["id"],
+                    "rank": len(response["recommendations"]) + 1,
+                    "why": why,
+                    "suggested_activity": activity,
+                    "activity_is_ai_suggestion": True,
+                    "visit_duration_seconds": visit,
+                    "visit_duration_is_estimate": True,
+                    "route": route,
+                    "total_duration_seconds": total,
+                    "constraint_evaluations": evaluations,
+                    "warnings": _dedupe(item_warnings),
+                }
+                response["places"].append(place)
+                response["recommendations"].append(recommendation)
+                response["warnings"].extend(item_warnings)
+                if len(response["recommendations"]) == request["limit"]:
+                    break
+            if len(response["recommendations"]) == request["limit"]:
+                break
+        if route_failed:
+            response["warnings"].append(text["route_failed"])
+            degraded = True
+        if response["recommendations"]:
+            response["status"] = "partial" if degraded else "matched"
+        else:
+            response["warnings"].append(text["no_match"])
+        return self._finish(response)
+
+    async def build_itinerary(self, request: JSON) -> JSON:
+        request = self._request("ItineraryRequest", request)
+        response = self._base(request, itinerary=True)
+        text = TEXT[request["locale"]]
+
+        async def fetch(place_id: str) -> JSON | None:
+            try:
+                place = await asyncio.wait_for(
+                    self.repository.get(place_id), timeout=self.timeout_seconds
+                )
+                if place is None:
+                    return None
+                validate_payload("Place", place)
+                return deepcopy(place) if place["id"] == place_id else None
+            except Exception:
+                return None
+
+        values = await asyncio.gather(*(fetch(place_id) for place_id in request["place_ids"]))
+        if any(place is None for place in values):
+            response["warnings"].append(text["selected_missing"])
+            return self._finish(response, itinerary=True)
+        places = [place for place in values if place is not None]
+        places, warnings, degraded = await self._enrich(places, request)
+        response["warnings"].extend(warnings)
+        evaluations = [self._evaluate(place, request) for place in places]
+        if not all(self._required_ok(value) for value in evaluations):
+            response["warnings"].append(text["selected_constraint"])
+            return self._finish(response, itinerary=True)
+        route = await self._route(places, request)
+        if route is None:
+            response["warnings"].append(text["route_failed"])
+            return self._finish(response, itinerary=True)
+        visits = [self._visit_seconds(place) for place in places]
+        total = sum(visits) + route["duration_seconds"]
+        if total > request["available_seconds"]:
+            response["warnings"].append(text["selected_budget"])
+            return self._finish(response, itinerary=True)
+        response["warnings"].extend(self._route_warnings(places, route, request["locale"]))
+        if route["method"] == "approximate":
+            degraded = True
+        for index, (place, evaluation, visit) in enumerate(
+            zip(places, evaluations, visits, strict=True), start=1
+        ):
+            _, activity, generator_warnings = await self._explain(
+                place, evaluation, request, total
+            )
+            response["warnings"].extend(generator_warnings)
+            if generator_warnings:
+                degraded = True
+            if not self._preferences_ok(evaluation):
+                response["warnings"].append(text["preferences"])
+                degraded = True
+            response["stops"].append({
+                "place_id": place["id"],
+                "order": index,
+                "visit_duration_seconds": visit,
+                "visit_duration_is_estimate": True,
+                "suggested_activity": activity,
+                "activity_is_ai_suggestion": True,
+                "constraint_evaluations": evaluation,
+            })
+        response.update(
+            status="partial" if degraded else "matched",
+            places=places,
+            route=route,
+            total_duration_seconds=total,
+        )
+        return self._finish(response, itinerary=True)
