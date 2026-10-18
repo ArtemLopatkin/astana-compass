@@ -1,8 +1,8 @@
 # Shared contracts — seed v0.1.0
 
-This is a machine-checkable integration seed, not a running application. `contracts.schema.json` is the canonical JSON Schema Draft 2020-12. Validate a named `$defs` entry, not the root union, for requests. `contracts.examples.json` contains only unmistakably synthetic places and evidence. No example proves a real venue, opening time, routing provider or completed feature.
+`contracts.schema.json` is the canonical JSON Schema Draft 2020-12. Validate a named `$defs` entry, not the root union. `contracts.examples.json` contains unmistakably synthetic places and evidence; no example proves a real venue or operational provider.
 
-The coordinator will move these five root files together into `packages/contracts` after browser upload. Until that coordinated move, agents must use the root paths. Update imports and CI together when moving them. Implementations may generate Python/TypeScript types from this schema; independently maintained wire models must pass the same fixtures. Propose a coordinated contract change before changing field names or meanings.
+The installable `astana-contracts` package contains generated copies, runtime validation and async ports. `scripts/generate_contracts.py` generates those resources and the TypeScript client types; `--check` detects drift. Canonical root schema/examples remain in place. Do not hand-edit snapshots or maintain competing wire models. Changes to field names or semantics require coordinated contract updates.
 
 ## Public endpoints
 
@@ -89,13 +89,13 @@ No network calls are required by this seed verifier. Future packages must distin
 
 ## Verification
 
-Requires Python >= 3.10. `jsonschema[format-nongpl]==4.26.0` was checked against the [official PyPI JSON endpoint](https://pypi.org/pypi/jsonschema/json). Install into an isolated environment:
+Use Python 3.12 and the root uv workspace:
 
 ```sh
-python3 -m venv .venv-contracts
-.venv-contracts/bin/pip install -r requirements-contracts.txt
-.venv-contracts/bin/python verify_contracts.py
-.venv-contracts/bin/python verify_contracts.py --definition RecommendationResponse --instance response.json
+uv sync --locked
+uv run python verify_contracts.py
+uv run python scripts/generate_contracts.py --check
+uv run pytest
 ```
 
-The verifier checks the schema itself, positive/negative fixtures, timezone-aware timestamps, references, evidence provenance markers, complete travel budgets, return flags, required constraints, and empty no-match results. It does not validate the truth of external facts, geometric route connectivity, operational providers, multilingual answer quality, or a deployed application.
+The schema verifier checks positive/negative fixtures, timezones, references, evidence markers, budgets and required constraints. Runtime packages and integration tests additionally exercise actual orchestration and HTTP boundaries. These offline tests do not validate external facts, route connectivity, paid providers, multilingual usability or a deployed application.
