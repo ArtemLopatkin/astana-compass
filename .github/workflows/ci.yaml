@@ -40,6 +40,8 @@ jobs:
         run: uv sync --locked --all-packages
       - name: Python tests
         run: uv run --locked pytest
+      - name: HTTP smoke client failure handling
+        run: uv run --locked python scripts/smoke.py --self-test
       - name: Canonical contract fixtures
         run: uv run --locked python verify_contracts.py
       - name: Generated artifacts are current
@@ -62,6 +64,8 @@ jobs:
         run: npm ci --prefix .github/typescript --ignore-scripts --no-audit --no-fund
       - name: Strict shared client type check
         run: npm run --prefix .github/typescript check
+      - name: Browser sandbox JavaScript syntax
+        run: node --check services/api/src/astana_api/static/sandbox.js
 
   container:
     runs-on: ubuntu-24.04
@@ -76,6 +80,13 @@ jobs:
         run: docker compose -f infra/compose.yaml up --build --detach --wait --wait-timeout 120 api
       - name: Probe readiness
         run: curl --fail --silent --show-error http://127.0.0.1:8000/v1/health/ready
+      - name: Fixture HTTP scenarios against the installed image
+        run: python3 scripts/smoke.py --base-url http://127.0.0.1:8000
+      - name: Packaged sandbox assets
+        run: |
+          curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8000/sandbox
+          curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8000/sandbox-assets/sandbox.js
+          curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8000/sandbox-assets/sandbox.css
       - name: Logs on failure
         if: failure()
         run: docker compose -f infra/compose.yaml logs --no-color --tail=100 api
